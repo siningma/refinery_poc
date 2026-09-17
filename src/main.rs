@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use refinery::Target;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Barrier;
@@ -38,6 +39,13 @@ enum Command {
         /// time and the rest block, then find nothing left to apply
         #[arg(long)]
         lock: bool,
+    },
+    /// Adopt refinery on a DB whose schema already exists: record migrations up to
+    /// --version as applied WITHOUT executing their SQL
+    Baseline {
+        /// Highest migration version already present in the database
+        #[arg(long)]
+        version: i32,
     },
     /// Drop users, refinery_schema_history and migration_lock for a clean slate
     Reset,
@@ -207,6 +215,41 @@ async fn cmd_race(runners: usize, lock: bool) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Mark every migration up to `version` as applied without running its SQL.
+///
+/// `Target::FakeVersion(n)` makes refinery write the `refinery_schema_history` rows (and
+/// create the history table) while skipping the migration SQL itself, then stop at n. Run
+/// this ONCE when adopting refinery on a database whose schema already exists; afterwards a
+/// normal `run_async` applies only versions above n.
+async fn cmd_baseline(version: i32) -> Result<(), AppError> {
+    let mut conn = connect().await?;
+
+    let report = embedded::migrations::runner()
+        .set_target(Target::FakeVersion(version))
+        .run_async(&mut conn)
+        .await?;
+
+    // NOTE: with a Fake target refinery leaves Report::applied_migrations empty even though
+    // it inserted the history rows, so read the table back to show what was recorded.
+    info!(
+        "baselined at version {version} (report lists {} applied, which is expected to be 0 \
+         for a fake target)",
+        report.applied_migrations().len()
+    );
+    for row in conn
+        .query(
+            "SELECT version, name FROM refinery_schema_history ORDER BY version",
+            &[],
+        )
+        .await?
+    {
+        let v: i32 = row.get(0);
+        let name: String = row.get(1);
+        info!("  recorded as applied: V{v}__{name}");
+    }
+    Ok(())
+}
+
 async fn cmd_reset() -> Result<(), AppError> {
     let conn = connect().await?;
     conn.batch_execute("DROP TABLE IF EXISTS users, refinery_schema_history, migration_lock;")
@@ -281,6 +324,7 @@ async fn main() {
     let result = match cli.command.unwrap_or(Command::Migrate) {
         Command::Migrate => cmd_migrate().await,
         Command::Race { threads, lock } => cmd_race(threads, lock).await,
+        Command::Baseline { version } => cmd_baseline(version).await,
         Command::Reset => cmd_reset().await,
         Command::Status => cmd_status().await,
     };

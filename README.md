@@ -24,8 +24,66 @@ Connection string defaults to `postgres://siningma@localhost/refinery_poc`; over
 | `cargo run -- migrate` | Runs `embedded::migrations::runner().run()` once. Applies `migrations/V1__create_users_table.sql`. |
 | `cargo run -- race --threads N` | Spawns N tokio tasks, each with its own `tokio_postgres::Client`, released simultaneously via a `tokio::sync::Barrier`, each calling `run_async()` against the *same fresh* schema. |
 | `cargo run -- race --threads N --lock` | Same race, but every runner serializes behind a DB row lock first. One applies; the rest block, then find nothing to apply. |
+| `cargo run -- baseline --version N` | Adopt refinery on a DB whose schema already exists: records migrations up to N as applied **without** running their SQL (`Target::FakeVersion`). |
 | `cargo run -- reset` | Drops `users`, `refinery_schema_history` and `migration_lock` for a clean slate. |
 | `cargo run -- status` | Dumps `refinery_schema_history` rows and `users` column list. |
+
+## Adopting refinery on a database that already has schema
+
+If the schema was created by hand or another tool, a plain `migrate` fails immediately —
+refinery sees an empty history and tries to apply V1 on top of objects that already exist:
+
+```
+$ cargo run -q -- migrate
+error: migration error
+  caused by: `error applying migration V1__create_users_table`, `db error`
+    caused by: ERROR: relation "users" already exists
+```
+
+The fix is to **baseline**: write migration files that describe the schema you already have,
+then record them as applied without executing them, using `Target::FakeVersion(n)`:
+
+```rust
+embedded::migrations::runner()
+    .set_target(Target::FakeVersion(1))   // fake V1..=V1, then stop
+    .run_async(&mut conn)
+    .await?;
+```
+
+With a fake target refinery creates `refinery_schema_history` and inserts the bookkeeping rows
+but skips each migration's SQL (`refinery_core/src/traits/sync.rs` — the migration SQL is only
+pushed into the batch when the target is *not* `Fake`/`FakeVersion`). Full adoption flow:
+
+```bash
+cargo run -- baseline --version 1   # record V1 as applied, do not execute it
+cargo run -- migrate                # applies only V2 onward, for real
+```
+
+Verified end to end against a hand-created `users` table: baseline recorded
+`V1__create_users_table` with no DDL executed, then `migrate` applied only
+`V2__add_users_status` (adding the `status` column), leaving history at versions 1 and 2 and
+subsequent runs a clean no-op.
+
+Use `Target::Fake` (no version) to baseline *every* embedded migration at once — the right
+choice when your migration files already describe the whole current schema.
+
+### Gotchas
+
+- **The report looks empty.** With a fake target refinery leaves `Report::applied_migrations`
+  empty even though it wrote the history rows, so don't treat `0 applied` as failure — read the
+  history table back to confirm.
+- **Checksums are frozen at baseline time.** The faked rows store the checksum of the migration
+  files *as they are now*. refinery cannot verify those files actually match the historical
+  schema — that accuracy is on you. Afterwards the files must not change: `abort_divergent`
+  defaults to true, so editing V1 later makes every future run fail with
+  `applied migration V1__... is different than filesystem one`.
+- **Baseline once, before rollout.** It is a one-shot administrative step, not something every
+  service should run at startup.
+- **`embed_migrations!` is compile-time, and cargo does not track newly added files in the
+  migrations directory.** Adding `V2__*.sql` and rebuilding is not enough — the macro will not
+  re-expand, and `migrate` silently reports "no migrations to apply". Force it with
+  `touch src/main.rs && cargo build` (or `cargo clean`). This bit during testing and is easy to
+  mistake for a migration bug.
 
 ## Result 1: the basic migration works
 
