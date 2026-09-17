@@ -1,11 +1,44 @@
+use clap::{Parser, Subcommand};
 use postgres::{Client, NoTls};
-use std::error::Error as StdError;
 use std::sync::{Arc, Barrier};
 use std::thread;
+use thiserror::Error;
+use tracing::{error, info};
 
 mod embedded {
     use refinery::embed_migrations;
     embed_migrations!("./migrations");
+}
+
+#[derive(Debug, Error)]
+enum AppError {
+    #[error("database error")]
+    Database(#[from] postgres::Error),
+    #[error("migration error")]
+    Migration(#[from] refinery::Error),
+}
+
+#[derive(Parser)]
+#[command(name = "refinery_poc", about = "refinery migration POC")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run pending migrations once
+    Migrate,
+    /// Race N concurrent runners against the same database
+    Race {
+        /// Number of concurrent runners
+        #[arg(long, default_value_t = 4)]
+        threads: usize,
+    },
+    /// Drop users and refinery_schema_history so migrations can be re-run from clean state
+    Reset,
+    /// Show refinery_schema_history rows and users columns
+    Status,
 }
 
 fn database_url() -> String {
@@ -13,46 +46,41 @@ fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://siningma@localhost/refinery_poc".to_string())
 }
 
-fn connect() -> Client {
-    Client::connect(&database_url(), NoTls).expect("failed to connect to postgres")
+fn connect() -> Result<Client, AppError> {
+    Ok(Client::connect(&database_url(), NoTls)?)
 }
 
 /// Walk the full `source()` chain of an error so the underlying SQLSTATE / message
-/// (buried a few layers below refinery's own Error type) is visible.
-fn print_error_chain(err: &(dyn StdError + 'static)) {
-    eprintln!("    error: {err}");
+/// (buried a few layers below refinery's own Error type, and now below AppError too)
+/// is visible.
+fn log_error_chain(err: &(dyn std::error::Error + 'static)) {
+    error!("error: {err}");
     let mut source = err.source();
     let mut depth = 1;
     while let Some(cause) = source {
-        eprintln!("    {}caused by: {cause}", "  ".repeat(depth));
+        error!("{}caused by: {cause}", "  ".repeat(depth));
         source = cause.source();
         depth += 1;
     }
 }
 
-fn cmd_migrate() {
-    let mut conn = connect();
-    match embedded::migrations::runner().run(&mut conn) {
-        Ok(report) => {
-            let applied = report.applied_migrations();
-            if applied.is_empty() {
-                println!("no migrations applied (already up to date)");
-            } else {
-                println!("applied {} migration(s):", applied.len());
-                for m in applied {
-                    println!("  {m}");
-                }
-            }
-        }
-        Err(e) => {
-            println!("migration failed:");
-            print_error_chain(&e);
+fn cmd_migrate() -> Result<(), AppError> {
+    let mut conn = connect()?;
+    let report = embedded::migrations::runner().run(&mut conn)?;
+    let applied = report.applied_migrations();
+    if applied.is_empty() {
+        info!("no migrations applied (already up to date)");
+    } else {
+        info!("applied {} migration(s):", applied.len());
+        for m in applied {
+            info!("  {m}");
         }
     }
+    Ok(())
 }
 
 fn cmd_race(threads: usize) {
-    println!("racing {threads} concurrent runners against the same database...\n");
+    info!("racing {threads} concurrent runners against the same database...");
 
     // Barrier releases all threads at once, so every runner hits
     // get_unapplied_migrations() -> apply in the same narrow window,
@@ -63,9 +91,13 @@ fn cmd_race(threads: usize) {
         .map(|i| {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let mut conn = connect();
+                let conn_result = connect();
                 barrier.wait();
-                let result = embedded::migrations::runner().run(&mut conn);
+                let result = conn_result.and_then(|mut conn| {
+                    embedded::migrations::runner()
+                        .run(&mut conn)
+                        .map_err(AppError::from)
+                });
                 (i, result)
             })
         })
@@ -79,52 +111,52 @@ fn cmd_race(threads: usize) {
         match result {
             Ok(report) => {
                 ok_count += 1;
-                println!(
+                info!(
                     "[thread {i}] Ok: applied {} migration(s)",
                     report.applied_migrations().len()
                 );
             }
             Err(e) => {
                 err_count += 1;
-                println!("[thread {i}] Err:");
-                print_error_chain(&e);
+                error!("[thread {i}] Err:");
+                log_error_chain(&e);
             }
         }
     }
 
-    println!("\ntally: {ok_count} succeeded, {err_count} failed (out of {threads} runners)");
+    info!("tally: {ok_count} succeeded, {err_count} failed (out of {threads} runners)");
 }
 
-fn cmd_reset() {
-    let mut conn = connect();
-    conn.batch_execute("DROP TABLE IF EXISTS users, refinery_schema_history;")
-        .expect("failed to reset tables");
-    println!("dropped users and refinery_schema_history (if they existed)");
+fn cmd_reset() -> Result<(), AppError> {
+    let mut conn = connect()?;
+    conn.batch_execute("DROP TABLE IF EXISTS users, refinery_schema_history;")?;
+    info!("dropped users and refinery_schema_history (if they existed)");
+    Ok(())
 }
 
-fn cmd_status() {
-    let mut conn = connect();
+fn cmd_status() -> Result<(), AppError> {
+    let mut conn = connect()?;
 
-    println!("-- refinery_schema_history --");
+    info!("-- refinery_schema_history --");
     match conn.query(
         "SELECT version, name, applied_on FROM refinery_schema_history ORDER BY version",
         &[],
     ) {
         Ok(rows) => {
             if rows.is_empty() {
-                println!("  (no rows)");
+                info!("  (no rows)");
             }
             for row in rows {
                 let version: i32 = row.get(0);
                 let name: String = row.get(1);
                 let applied_on: String = row.get(2);
-                println!("  version={version} name={name} applied_on={applied_on}");
+                info!("  version={version} name={name} applied_on={applied_on}");
             }
         }
-        Err(e) => println!("  (table does not exist yet: {e})"),
+        Err(e) => info!("  (table does not exist yet: {e})"),
     }
 
-    println!("\n-- users columns --");
+    info!("-- users columns --");
     match conn.query(
         "SELECT column_name, data_type FROM information_schema.columns \
          WHERE table_name = 'users' ORDER BY ordinal_position",
@@ -132,41 +164,45 @@ fn cmd_status() {
     ) {
         Ok(rows) => {
             if rows.is_empty() {
-                println!("  (table does not exist)");
+                info!("  (table does not exist)");
             }
             for row in rows {
                 let name: String = row.get(0);
                 let data_type: String = row.get(1);
-                println!("  {name}: {data_type}");
+                info!("  {name}: {data_type}");
             }
         }
-        Err(e) => println!("  (error querying columns: {e})"),
+        Err(e) => info!("  (error querying columns: {e})"),
     }
+
+    Ok(())
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // tracing-subscriber's default features bridge `log` records (which is what
+    // refinery emits internally) into `tracing` automatically on init().
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let subcommand = args.get(1).map(String::as_str).unwrap_or("migrate");
+    let cli = Cli::parse();
 
-    match subcommand {
-        "migrate" => cmd_migrate(),
-        "race" => {
-            let threads = args
-                .iter()
-                .position(|a| a == "--threads")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(4);
+    let result = match cli.command.unwrap_or(Command::Migrate) {
+        Command::Migrate => cmd_migrate(),
+        Command::Race { threads } => {
             cmd_race(threads);
+            Ok(())
         }
-        "reset" => cmd_reset(),
-        "status" => cmd_status(),
-        other => {
-            eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: refinery_poc [migrate|race --threads N|reset|status]");
-            std::process::exit(1);
-        }
+        Command::Reset => cmd_reset(),
+        Command::Status => cmd_status(),
+    };
+
+    if let Err(e) = result {
+        error!("fatal:");
+        log_error_chain(&e);
+        std::process::exit(1);
     }
 }
