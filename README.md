@@ -1,7 +1,8 @@
 # refinery POC: first migration + concurrent-runner contention
 
 A minimal Rust project exploring the [`refinery`](https://docs.rs/refinery/latest/refinery/)
-SQL migration crate (v0.9.2) against a local PostgreSQL 17 instance (via `brew`), and
+SQL migration crate (v0.9.2) against a local PostgreSQL 17 instance (via `brew`), using
+`tokio-postgres` on a tokio runtime (refinery's `tokio-postgres` feature + `run_async`), and
 specifically answering: **when two services run migrations concurrently, does one win and
 the other cleanly no-op?**
 
@@ -21,7 +22,7 @@ Connection string defaults to `postgres://siningma@localhost/refinery_poc`; over
 | Command | What it does |
 |---|---|
 | `cargo run -- migrate` | Runs `embedded::migrations::runner().run()` once. Applies `migrations/V1__create_users_table.sql`. |
-| `cargo run -- race --threads N` | Spawns N threads, each with its own `postgres::Client`, released simultaneously via a `Barrier`, each calling `run()` against the *same fresh* schema. |
+| `cargo run -- race --threads N` | Spawns N tokio tasks, each with its own `tokio_postgres::Client`, released simultaneously via a `tokio::sync::Barrier`, each calling `run_async()` against the *same fresh* schema. |
 | `cargo run -- race --threads N --lock` | Same race, but every runner serializes behind a DB row lock first. One applies; the rest block, then find nothing to apply. |
 | `cargo run -- reset` | Drops `users`, `refinery_schema_history` and `migration_lock` for a clean slate. |
 | `cargo run -- status` | Dumps `refinery_schema_history` rows and `users` column list. |
@@ -147,8 +148,9 @@ Two implementation details that matter:
 
 - **Migrations run on a second connection.** refinery opens its own transactions internally,
   which cannot nest inside the transaction holding the lock — so each runner uses one
-  connection for the lock and one for refinery.
-- **The lock table is bootstrapped once from the main thread**, before any runner starts.
+  connection for the lock and one for refinery. (Each `tokio_postgres::connect` also spawns
+  a task to drive its `Connection` future, which must be polled for the client to work.)
+- **The lock table is bootstrapped once before any runner starts.**
   Creating it concurrently would hit the very same `CREATE TABLE` catalog race that Result 2
   demonstrates. In a real deployment this table is infrastructure that must pre-exist the
   services depending on it (e.g. created by a bootstrap job, not by the racing services).

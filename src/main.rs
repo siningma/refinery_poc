@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
-use postgres::{Client, NoTls};
-use std::sync::{Arc, Barrier};
-use std::thread;
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Barrier;
+use tokio_postgres::{Client, NoTls};
 use tracing::{error, info};
 
 mod embedded {
@@ -13,7 +13,7 @@ mod embedded {
 #[derive(Debug, Error)]
 enum AppError {
     #[error("database error")]
-    Database(#[from] postgres::Error),
+    Database(#[from] tokio_postgres::Error),
     #[error("migration error")]
     Migration(#[from] refinery::Error),
 }
@@ -50,8 +50,19 @@ fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://siningma@localhost/refinery_poc".to_string())
 }
 
-fn connect() -> Result<Client, AppError> {
-    Ok(Client::connect(&database_url(), NoTls)?)
+/// Open a connection and spawn its driver task.
+///
+/// tokio-postgres splits a connection into a `Client` (used to issue queries) and a
+/// `Connection` future that performs the actual I/O — the latter must be polled for the
+/// client to make progress, so it gets its own task. It resolves once the client is dropped.
+async fn connect() -> Result<Client, AppError> {
+    let (client, connection) = tokio_postgres::connect(&database_url(), NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            error!("connection driver error: {e}");
+        }
+    });
+    Ok(client)
 }
 
 /// Walk the full `source()` chain of an error so the underlying SQLSTATE / message
@@ -68,22 +79,23 @@ fn log_error_chain(err: &(dyn std::error::Error + 'static)) {
     }
 }
 
-fn run_migrations(conn: &mut Client) -> Result<refinery::Report, AppError> {
-    Ok(embedded::migrations::runner().run(conn)?)
+async fn run_migrations(conn: &mut Client) -> Result<refinery::Report, AppError> {
+    Ok(embedded::migrations::runner().run_async(conn).await?)
 }
 
 /// Create the sentinel lock table and its single row.
 ///
-/// This deliberately runs ONCE from the main thread before any runners start: bootstrapping
-/// the lock table is itself a `CREATE TABLE` that would hit the same catalog race the
-/// unlocked demo exposes. In a real deployment this is infrastructure that has to exist
-/// before the services that depend on it.
-fn ensure_lock_table() -> Result<(), AppError> {
-    let mut conn = connect()?;
+/// This deliberately runs ONCE before any runner starts: bootstrapping the lock table is
+/// itself a `CREATE TABLE` that would hit the same catalog race the unlocked demo exposes.
+/// In a real deployment this is infrastructure that has to exist before the services that
+/// depend on it.
+async fn ensure_lock_table() -> Result<(), AppError> {
+    let conn = connect().await?;
     conn.batch_execute(
         "CREATE TABLE IF NOT EXISTS migration_lock (id INT PRIMARY KEY); \
          INSERT INTO migration_lock (id) VALUES (1) ON CONFLICT DO NOTHING;",
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -93,24 +105,25 @@ fn ensure_lock_table() -> Result<(), AppError> {
 /// this transaction commits — ordinary row-level locking, no advisory locks involved.
 /// Migrations run on a *separate* connection because refinery opens its own transactions,
 /// which cannot nest inside the one holding the lock.
-fn run_migrations_locked(
+async fn run_migrations_locked(
     conn: &mut Client,
     lock_conn: &mut Client,
 ) -> Result<refinery::Report, AppError> {
-    let mut tx = lock_conn.transaction()?;
+    let tx = lock_conn.transaction().await?;
     // Blocks here until whichever runner currently holds the row commits.
-    tx.execute("SELECT id FROM migration_lock WHERE id = 1 FOR UPDATE", &[])?;
+    tx.execute("SELECT id FROM migration_lock WHERE id = 1 FOR UPDATE", &[])
+        .await?;
 
-    let report = run_migrations(conn);
+    let report = run_migrations(conn).await;
 
     // Release the lock regardless of whether the migration itself succeeded.
-    tx.commit()?;
+    tx.commit().await?;
     report
 }
 
-fn cmd_migrate() -> Result<(), AppError> {
-    let mut conn = connect()?;
-    let report = run_migrations(&mut conn)?;
+async fn cmd_migrate() -> Result<(), AppError> {
+    let mut conn = connect().await?;
+    let report = run_migrations(&mut conn).await?;
     let applied = report.applied_migrations();
     if applied.is_empty() {
         info!("no migrations applied (already up to date)");
@@ -123,36 +136,40 @@ fn cmd_migrate() -> Result<(), AppError> {
     Ok(())
 }
 
-fn cmd_race(threads: usize, lock: bool) -> Result<(), AppError> {
+async fn cmd_race(runners: usize, lock: bool) -> Result<(), AppError> {
     if lock {
-        ensure_lock_table()?;
-        info!("racing {threads} runners serialized behind a DB row lock...");
+        ensure_lock_table().await?;
+        info!("racing {runners} runners serialized behind a DB row lock...");
     } else {
-        info!("racing {threads} concurrent runners against the same database...");
+        info!("racing {runners} concurrent runners against the same database...");
     }
 
-    // Barrier releases all threads at once, so every runner hits
+    // Barrier releases all tasks at once, so every runner hits
     // get_unapplied_migrations() -> apply in the same narrow window,
-    // regardless of how long each thread took to connect.
-    let barrier = Arc::new(Barrier::new(threads));
+    // regardless of how long each task took to connect.
+    let barrier = Arc::new(Barrier::new(runners));
 
-    let handles: Vec<_> = (0..threads)
+    let handles: Vec<_> = (0..runners)
         .map(|i| {
             let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
+            tokio::spawn(async move {
                 // Connect before the barrier so connection setup is not part of the race.
-                let prepared = (|| -> Result<(Client, Option<Client>), AppError> {
-                    let conn = connect()?;
-                    let lock_conn = if lock { Some(connect()?) } else { None };
-                    Ok((conn, lock_conn))
-                })();
+                let prepared = async {
+                    let conn = connect().await?;
+                    let lock_conn = if lock { Some(connect().await?) } else { None };
+                    Ok::<_, AppError>((conn, lock_conn))
+                }
+                .await;
 
-                barrier.wait();
+                barrier.wait().await;
 
-                let result = prepared.and_then(|(mut conn, lock_conn)| match lock_conn {
-                    Some(mut lock_conn) => run_migrations_locked(&mut conn, &mut lock_conn),
-                    None => run_migrations(&mut conn),
-                });
+                let result = match prepared {
+                    Ok((mut conn, Some(mut lock_conn))) => {
+                        run_migrations_locked(&mut conn, &mut lock_conn).await
+                    }
+                    Ok((mut conn, None)) => run_migrations(&mut conn).await,
+                    Err(e) => Err(e),
+                };
                 (i, result)
             })
         })
@@ -163,21 +180,21 @@ fn cmd_race(threads: usize, lock: bool) -> Result<(), AppError> {
     let mut err_count = 0;
 
     for handle in handles {
-        let (i, result) = handle.join().expect("thread panicked");
+        let (i, result) = handle.await.expect("runner task panicked");
         match result {
             Ok(report) => {
                 let applied = report.applied_migrations().len();
                 if applied == 0 {
                     noop_count += 1;
-                    info!("[thread {i}] Ok: no-op, migrations already applied by another runner");
+                    info!("[runner {i}] Ok: no-op, migrations already applied by another runner");
                 } else {
                     applied_count += 1;
-                    info!("[thread {i}] Ok: applied {applied} migration(s)");
+                    info!("[runner {i}] Ok: applied {applied} migration(s)");
                 }
             }
             Err(e) => {
                 err_count += 1;
-                error!("[thread {i}] Err:");
+                error!("[runner {i}] Err:");
                 log_error_chain(&e);
             }
         }
@@ -185,26 +202,30 @@ fn cmd_race(threads: usize, lock: bool) -> Result<(), AppError> {
 
     info!(
         "tally: {applied_count} applied, {noop_count} no-op, {err_count} failed \
-         (out of {threads} runners)"
+         (out of {runners} runners)"
     );
     Ok(())
 }
 
-fn cmd_reset() -> Result<(), AppError> {
-    let mut conn = connect()?;
-    conn.batch_execute("DROP TABLE IF EXISTS users, refinery_schema_history, migration_lock;")?;
+async fn cmd_reset() -> Result<(), AppError> {
+    let conn = connect().await?;
+    conn.batch_execute("DROP TABLE IF EXISTS users, refinery_schema_history, migration_lock;")
+        .await?;
     info!("dropped users, refinery_schema_history and migration_lock (if they existed)");
     Ok(())
 }
 
-fn cmd_status() -> Result<(), AppError> {
-    let mut conn = connect()?;
+async fn cmd_status() -> Result<(), AppError> {
+    let conn = connect().await?;
 
     info!("-- refinery_schema_history --");
-    match conn.query(
-        "SELECT version, name, applied_on FROM refinery_schema_history ORDER BY version",
-        &[],
-    ) {
+    match conn
+        .query(
+            "SELECT version, name, applied_on FROM refinery_schema_history ORDER BY version",
+            &[],
+        )
+        .await
+    {
         Ok(rows) => {
             if rows.is_empty() {
                 info!("  (no rows)");
@@ -220,11 +241,14 @@ fn cmd_status() -> Result<(), AppError> {
     }
 
     info!("-- users columns --");
-    match conn.query(
-        "SELECT column_name, data_type FROM information_schema.columns \
-         WHERE table_name = 'users' ORDER BY ordinal_position",
-        &[],
-    ) {
+    match conn
+        .query(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_name = 'users' ORDER BY ordinal_position",
+            &[],
+        )
+        .await
+    {
         Ok(rows) => {
             if rows.is_empty() {
                 info!("  (table does not exist)");
@@ -241,7 +265,8 @@ fn cmd_status() -> Result<(), AppError> {
     Ok(())
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // tracing-subscriber's default features bridge `log` records (which is what
     // refinery emits internally) into `tracing` automatically on init().
     tracing_subscriber::fmt()
@@ -254,10 +279,10 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command.unwrap_or(Command::Migrate) {
-        Command::Migrate => cmd_migrate(),
-        Command::Race { threads, lock } => cmd_race(threads, lock),
-        Command::Reset => cmd_reset(),
-        Command::Status => cmd_status(),
+        Command::Migrate => cmd_migrate().await,
+        Command::Race { threads, lock } => cmd_race(threads, lock).await,
+        Command::Reset => cmd_reset().await,
+        Command::Status => cmd_status().await,
     };
 
     if let Err(e) = result {
