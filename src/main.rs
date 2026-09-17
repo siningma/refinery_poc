@@ -34,8 +34,12 @@ enum Command {
         /// Number of concurrent runners
         #[arg(long, default_value_t = 4)]
         threads: usize,
+        /// Serialize runners behind a DB row lock, so only one applies migrations at a
+        /// time and the rest block, then find nothing left to apply
+        #[arg(long)]
+        lock: bool,
     },
-    /// Drop users and refinery_schema_history so migrations can be re-run from clean state
+    /// Drop users, refinery_schema_history and migration_lock for a clean slate
     Reset,
     /// Show refinery_schema_history rows and users columns
     Status,
@@ -64,9 +68,49 @@ fn log_error_chain(err: &(dyn std::error::Error + 'static)) {
     }
 }
 
+fn run_migrations(conn: &mut Client) -> Result<refinery::Report, AppError> {
+    Ok(embedded::migrations::runner().run(conn)?)
+}
+
+/// Create the sentinel lock table and its single row.
+///
+/// This deliberately runs ONCE from the main thread before any runners start: bootstrapping
+/// the lock table is itself a `CREATE TABLE` that would hit the same catalog race the
+/// unlocked demo exposes. In a real deployment this is infrastructure that has to exist
+/// before the services that depend on it.
+fn ensure_lock_table() -> Result<(), AppError> {
+    let mut conn = connect()?;
+    conn.batch_execute(
+        "CREATE TABLE IF NOT EXISTS migration_lock (id INT PRIMARY KEY); \
+         INSERT INTO migration_lock (id) VALUES (1) ON CONFLICT DO NOTHING;",
+    )?;
+    Ok(())
+}
+
+/// Take the row lock on the sentinel row, run migrations while holding it, then release.
+///
+/// `SELECT ... FOR UPDATE` blocks any other transaction trying to lock the same row until
+/// this transaction commits — ordinary row-level locking, no advisory locks involved.
+/// Migrations run on a *separate* connection because refinery opens its own transactions,
+/// which cannot nest inside the one holding the lock.
+fn run_migrations_locked(
+    conn: &mut Client,
+    lock_conn: &mut Client,
+) -> Result<refinery::Report, AppError> {
+    let mut tx = lock_conn.transaction()?;
+    // Blocks here until whichever runner currently holds the row commits.
+    tx.execute("SELECT id FROM migration_lock WHERE id = 1 FOR UPDATE", &[])?;
+
+    let report = run_migrations(conn);
+
+    // Release the lock regardless of whether the migration itself succeeded.
+    tx.commit()?;
+    report
+}
+
 fn cmd_migrate() -> Result<(), AppError> {
     let mut conn = connect()?;
-    let report = embedded::migrations::runner().run(&mut conn)?;
+    let report = run_migrations(&mut conn)?;
     let applied = report.applied_migrations();
     if applied.is_empty() {
         info!("no migrations applied (already up to date)");
@@ -79,8 +123,13 @@ fn cmd_migrate() -> Result<(), AppError> {
     Ok(())
 }
 
-fn cmd_race(threads: usize) {
-    info!("racing {threads} concurrent runners against the same database...");
+fn cmd_race(threads: usize, lock: bool) -> Result<(), AppError> {
+    if lock {
+        ensure_lock_table()?;
+        info!("racing {threads} runners serialized behind a DB row lock...");
+    } else {
+        info!("racing {threads} concurrent runners against the same database...");
+    }
 
     // Barrier releases all threads at once, so every runner hits
     // get_unapplied_migrations() -> apply in the same narrow window,
@@ -91,30 +140,40 @@ fn cmd_race(threads: usize) {
         .map(|i| {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let conn_result = connect();
+                // Connect before the barrier so connection setup is not part of the race.
+                let prepared = (|| -> Result<(Client, Option<Client>), AppError> {
+                    let conn = connect()?;
+                    let lock_conn = if lock { Some(connect()?) } else { None };
+                    Ok((conn, lock_conn))
+                })();
+
                 barrier.wait();
-                let result = conn_result.and_then(|mut conn| {
-                    embedded::migrations::runner()
-                        .run(&mut conn)
-                        .map_err(AppError::from)
+
+                let result = prepared.and_then(|(mut conn, lock_conn)| match lock_conn {
+                    Some(mut lock_conn) => run_migrations_locked(&mut conn, &mut lock_conn),
+                    None => run_migrations(&mut conn),
                 });
                 (i, result)
             })
         })
         .collect();
 
-    let mut ok_count = 0;
+    let mut applied_count = 0;
+    let mut noop_count = 0;
     let mut err_count = 0;
 
     for handle in handles {
         let (i, result) = handle.join().expect("thread panicked");
         match result {
             Ok(report) => {
-                ok_count += 1;
-                info!(
-                    "[thread {i}] Ok: applied {} migration(s)",
-                    report.applied_migrations().len()
-                );
+                let applied = report.applied_migrations().len();
+                if applied == 0 {
+                    noop_count += 1;
+                    info!("[thread {i}] Ok: no-op, migrations already applied by another runner");
+                } else {
+                    applied_count += 1;
+                    info!("[thread {i}] Ok: applied {applied} migration(s)");
+                }
             }
             Err(e) => {
                 err_count += 1;
@@ -124,13 +183,17 @@ fn cmd_race(threads: usize) {
         }
     }
 
-    info!("tally: {ok_count} succeeded, {err_count} failed (out of {threads} runners)");
+    info!(
+        "tally: {applied_count} applied, {noop_count} no-op, {err_count} failed \
+         (out of {threads} runners)"
+    );
+    Ok(())
 }
 
 fn cmd_reset() -> Result<(), AppError> {
     let mut conn = connect()?;
-    conn.batch_execute("DROP TABLE IF EXISTS users, refinery_schema_history;")?;
-    info!("dropped users and refinery_schema_history (if they existed)");
+    conn.batch_execute("DROP TABLE IF EXISTS users, refinery_schema_history, migration_lock;")?;
+    info!("dropped users, refinery_schema_history and migration_lock (if they existed)");
     Ok(())
 }
 
@@ -192,10 +255,7 @@ fn main() {
 
     let result = match cli.command.unwrap_or(Command::Migrate) {
         Command::Migrate => cmd_migrate(),
-        Command::Race { threads } => {
-            cmd_race(threads);
-            Ok(())
-        }
+        Command::Race { threads, lock } => cmd_race(threads, lock),
         Command::Reset => cmd_reset(),
         Command::Status => cmd_status(),
     };
