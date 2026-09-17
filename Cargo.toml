@@ -1,0 +1,10 @@
+[package]
+name = "refinery_poc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+refinery = { version = "0.9.2", features = ["postgres"] }
+postgres = "0.19"
+log = "0.4"
+env_logger = "0.11"
